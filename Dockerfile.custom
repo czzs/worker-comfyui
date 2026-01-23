@@ -7,4 +7,5 @@ RUN comfy-node-install \
     comfyui-kjnodes \
     comfyui-videohelpersuite \
     comfyui-frame-interpolation \
-    comfyui_essentials
+    comfyui_essentials \
+    comfyui-gimm-vfi
