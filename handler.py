@@ -73,6 +73,31 @@ def _comfy_server_status():
         return {"reachable": False, "error": str(exc)}
 
 
+def _is_job_in_queue(prompt_id):
+    """Check if a prompt is still running or pending in ComfyUI's queue.
+
+    Polls the ``/queue`` endpoint and looks for *prompt_id* in both
+    ``queue_running`` and ``queue_pending``.  Returns ``True`` if found,
+    ``False`` if not found, and ``None`` if the check itself failed (e.g.
+    network error).
+    """
+    try:
+        resp = requests.get(f"http://{COMFY_HOST}/queue", timeout=5)
+        resp.raise_for_status()
+        queue_data = resp.json()
+        for item in queue_data.get("queue_running", []):
+            # Each item is a list; the prompt_id is at index 1
+            if len(item) >= 2 and item[1] == prompt_id:
+                return True
+        for item in queue_data.get("queue_pending", []):
+            if len(item) >= 2 and item[1] == prompt_id:
+                return True
+        return False
+    except Exception as exc:
+        logger.warning("Error polling /queue: %s", exc)
+        return None
+
+
 def _attempt_websocket_reconnect(ws_url, max_attempts, delay_s, initial_error):
     """
     Attempts to reconnect to the WebSocket server after a disconnect.
@@ -635,7 +660,7 @@ def handler(job):
                     continue
             except websocket.WebSocketTimeoutException:
                 # No message received within WEBSOCKET_MESSAGE_TIMEOUT seconds.
-                # Check whether ComfyUI is still alive before resuming the wait.
+                # 1) Check whether ComfyUI HTTP is alive at all.
                 srv_status = _comfy_server_status()
                 if not srv_status["reachable"]:
                     raise ValueError(
@@ -643,11 +668,28 @@ def handler(job):
                         f"(no message for {WEBSOCKET_MESSAGE_TIMEOUT}s). "
                         f"Server status: {srv_status}"
                     )
-                print(
-                    f"worker-comfyui - No WebSocket message for {WEBSOCKET_MESSAGE_TIMEOUT}s, "
-                    f"but ComfyUI is still reachable. Continuing to wait..."
-                )
-                continue
+
+                # 2) Check whether our job is still in the queue (running/pending).
+                in_queue = _is_job_in_queue(prompt_id)
+                if in_queue:
+                    print(
+                        f"worker-comfyui - No WebSocket message for {WEBSOCKET_MESSAGE_TIMEOUT}s, "
+                        f"but job {prompt_id} is still in ComfyUI queue. Continuing to wait..."
+                    )
+                    continue
+                elif in_queue is None:
+                    # Queue check failed (network blip) — give benefit of the doubt.
+                    print(
+                        f"worker-comfyui - No WebSocket message for {WEBSOCKET_MESSAGE_TIMEOUT}s. "
+                        f"Queue check failed; ComfyUI HTTP is reachable so continuing to wait..."
+                    )
+                    continue
+                else:
+                    # Job is NOT in queue and NOT completed via WS — truly stuck.
+                    raise ValueError(
+                        f"WebSocket message timeout: no message for {WEBSOCKET_MESSAGE_TIMEOUT}s "
+                        f"and job {prompt_id} is no longer in ComfyUI queue."
+                    )
             except websocket.WebSocketConnectionClosedException as closed_err:
                 try:
                     # Attempt to reconnect
