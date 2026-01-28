@@ -38,6 +38,11 @@ COMFY_API_AVAILABLE_MAX_RETRIES = 500
 # If the respective env-vars are not supplied we fall back to sensible defaults ("5" and "3").
 WEBSOCKET_RECONNECT_ATTEMPTS = int(os.environ.get("WEBSOCKET_RECONNECT_ATTEMPTS", 5))
 WEBSOCKET_RECONNECT_DELAY_S = int(os.environ.get("WEBSOCKET_RECONNECT_DELAY_S", 3))
+# Maximum seconds to wait for a single WebSocket message before checking
+# whether ComfyUI is still alive. Heavy workloads (e.g. video frame
+# interpolation) can produce long silences on the socket. Default: 600 s
+# (10 minutes). Set to 0 to disable (recv blocks indefinitely).
+WEBSOCKET_MESSAGE_TIMEOUT = int(os.environ.get("WEBSOCKET_MESSAGE_TIMEOUT", 600))
 
 # Extra verbose websocket trace logs (set WEBSOCKET_TRACE=true to enable)
 if os.environ.get("WEBSOCKET_TRACE", "false").lower() == "true":
@@ -564,7 +569,9 @@ def handler(job):
         print(f"worker-comfyui - Connecting to websocket: {ws_url}")
         ws = websocket.WebSocket()
         ws.connect(ws_url, timeout=10)
-        print(f"worker-comfyui - Websocket connected")
+        if WEBSOCKET_MESSAGE_TIMEOUT > 0:
+            ws.settimeout(WEBSOCKET_MESSAGE_TIMEOUT)
+        print(f"worker-comfyui - Websocket connected (message timeout: {WEBSOCKET_MESSAGE_TIMEOUT}s)")
 
         # Queue the workflow
         try:
@@ -627,7 +634,19 @@ def handler(job):
                 else:
                     continue
             except websocket.WebSocketTimeoutException:
-                print(f"worker-comfyui - Websocket receive timed out. Still waiting...")
+                # No message received within WEBSOCKET_MESSAGE_TIMEOUT seconds.
+                # Check whether ComfyUI is still alive before resuming the wait.
+                srv_status = _comfy_server_status()
+                if not srv_status["reachable"]:
+                    raise ValueError(
+                        f"ComfyUI became unreachable while waiting for WebSocket messages "
+                        f"(no message for {WEBSOCKET_MESSAGE_TIMEOUT}s). "
+                        f"Server status: {srv_status}"
+                    )
+                print(
+                    f"worker-comfyui - No WebSocket message for {WEBSOCKET_MESSAGE_TIMEOUT}s, "
+                    f"but ComfyUI is still reachable. Continuing to wait..."
+                )
                 continue
             except websocket.WebSocketConnectionClosedException as closed_err:
                 try:
@@ -639,6 +658,8 @@ def handler(job):
                         closed_err,
                     )
 
+                    if WEBSOCKET_MESSAGE_TIMEOUT > 0:
+                        ws.settimeout(WEBSOCKET_MESSAGE_TIMEOUT)
                     print(
                         "worker-comfyui - Resuming message listening after successful reconnect."
                     )
